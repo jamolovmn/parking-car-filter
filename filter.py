@@ -25,11 +25,24 @@ MIN_AREA  = 0.05    # "mashina bor" deb hisoblash uchun eng kichik maydon
 GAP_FRAMES = 4      # shuncha ketma-ket bo'sh kadr = mashina o'tdi
 # Raqam (plaka) detektori — har mashinaning kadrlarini tekshiradi (kamera burchagidan mustaqil)
 PLATE_MODEL = "plate_yolo.pt"
-PLATE_TH    = 0.10   # shu ishonchdan yuqori = "raqam bor" (o'rtacha: uzoq/raqamsizni tashlaydi, raqamlini oladi)
+# 2026-11-07 (egasining qarori): 0.10 -> 0.45.
+# Dalil: egasi qo'lda o'chirgan rasmlar 0.129 / 0.132 / 0.206 ishonchli
+# edi (ularda raqam KO'RINMAYDI), qoldirgani 0.742 (raqam toza o'qiladi).
+# 0.45 chegarasi shu ajratishni avtomatik qiladi.
+PLATE_TH    = float(os.environ.get("PLATE_TH", "0.45"))
 MAX_PASSAGE_CHECK = 40   # bir mashinada eng ko'pi shuncha kadr raqamga tekshiriladi
 IMGSZ     = 256
-VEHICLE   = {2, 3, 5, 7}
-DL_WORKERS = 16
+# 2026-11-07 (egasining qarori): FAQAT yengil avtomobil.
+# COCO sinflari: 2=car, 3=moto, 5=bus, 7=truck. Moto/yuk/avtobus KERAKMAS.
+# Kerak bo'lsa: VEHICLE_CLASSES="2,5,7" python filter.py <sayt>
+VEHICLE   = {int(x) for x in os.environ.get("VEHICLE_CLASSES", "2").split(",") if x.strip()}
+# 2026-11-07 O'LCHANDI: 16 parallel so'rov parking serverini bo'g'ib qo'yardi.
+# Xato: HTTP 500 (server thumbnail yasay olmayapti).
+# O'LCHOV: o'sha 200 ta fayl 4 parallel bilan 200/200 ochildi, 8-16 parallel
+# bilan 500 beradi. Ya'ni ayb faylda ham, tokenda ham, kanalda ham emas —
+# parking serveri (mini-PC) parallel yukka dosh berolmaydi va uzoq
+# ishlagandan keyin yomonlashadi (~20 ming rasmdan keyin boshlanadi).
+DL_WORKERS = int(os.environ.get("DL_WORKERS", "4"))
 PREFETCH  = 16
 # 2026-11-04: egasining talabi bilan 50 -> 200 (har kameradan max mashina).
 # 2026-11-07 (egasining talabi): bitta mashina KETMA-KET bir necha marta
@@ -38,6 +51,9 @@ PREFETCH  = 16
 # kutiladi; shu vaqt ichidagi O'SHA TURDAGI mashina bir xil deb tashlanadi.
 # Tur boshqa bo'lsa (masalan avtobus keldi) — darhol o'tadi, kutilmaydi.
 COOLDOWN_SEC = float(os.environ.get("COOLDOWN_SEC", "20"))
+# Server bo'g'ilganda qancha dam berish va necha marta urinish
+PAUSE_SEC  = float(os.environ.get("PAUSE_SEC", "30"))
+MAX_STALLS = int(os.environ.get("MAX_STALLS", "10"))
 VEHICLE_NAMES = {2: "car", 3: "moto", 5: "bus", 7: "truck"}
 
 MAX_SELECT = int(os.environ.get("MAX_SELECT", "200"))
@@ -98,6 +114,28 @@ def _clean_host(host):
     return f"{u.scheme}://{u.netloc}"
 
 
+# 2026-11-07: token/sessiya muddati tugasa HAMMA so'rov xato bera boshlaydi
+# va skan "tarmoq uzildi" deb to'xtardi. O'LCHANDI: ikkala mashinada ham
+# ~21-22 ming rasmdan keyin uzildi, o'sha kadrlar esa YANGI token bilan
+# darhol ochildi (30/30). Shuning uchun token global saqlanadi va
+# xatolar ko'payganda QAYTA LOGIN qilinadi.
+TOKEN = {"v": None}
+CREDS = {"host": None, "user": None, "pwd": None}
+
+
+def refresh_token(logf=None):
+    """Qayta login qilib yangi token oladi. Muvaffaqiyatli bo'lsa True."""
+    try:
+        TOKEN["v"] = login(CREDS["host"], CREDS["user"], CREDS["pwd"])
+        if logf:
+            log("    token yangilandi", logf)
+        return True
+    except Exception as e:
+        if logf:
+            log(f"    token yangilanmadi: {type(e).__name__}", logf)
+        return False
+
+
 def login(host, user, pwd, retries=2):
     host = _clean_host(host)
     data = json.dumps({"username": user, "password": pwd}).encode()
@@ -113,12 +151,17 @@ def login(host, user, pwd, retries=2):
     raise last     # server uzilgan — sayt keyin avto qayta urinadi
 
 
+LAST_ERR = {"v": None}      # oxirgi xato sababi (log uchun) — 2026-11-07
+
+
 def _get(url, token, retries=3):
     for i in range(retries):
         try:
             req = urllib.request.Request(url, headers={"X-Auth": token})
             return urllib.request.urlopen(req, timeout=20).read()  # tez aniqlash
-        except Exception:
+        except Exception as e:
+            code = getattr(e, "code", "")
+            LAST_ERR["v"] = f"{type(e).__name__}{code}"
             if i == retries - 1:
                 return None
             time.sleep(1)
@@ -168,9 +211,27 @@ def frame_ts(name):
 def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
     """Bitta kamera papkasini skan qiladi. Tanlangan mashinalar sonini qaytaradi."""
     os.makedirs(seldir, exist_ok=True)
-    names = list_images(host, token, folder)
-    total = len(names)
-    log(f"  {folder}: {total} ta rasm", logf)
+    all_names = list_images(host, token, folder)
+    total = len(all_names)
+
+    # 2026-11-07 (egasining talabi): tarmoq uzilsa kamera BOSHIDAN
+    # boshlanardi — 21 500 rasmlik ish yo'qolgan edi. Endi joy faylga
+    # yozib boriladi va uzilgandan keyin O'SHA JOYDAN davom etadi.
+    # Joy faqat o'tish YOPIQ paytda yoziladi, aks holda yarim mashina
+    # ikkiga bo'linib qolardi.
+    pfile = os.path.join(os.path.dirname(seldir), "progress.txt")
+    start = 0
+    try:
+        with open(pfile, encoding="utf-8") as f:
+            start = max(0, min(int(f.read().strip()), total))
+    except (OSError, ValueError):
+        start = 0
+    names = all_names[start:]
+    if start:
+        log(f"  {folder}: {total} ta rasm — {start}-dan DAVOM etamiz "
+            f"(qolgani {len(names)})", logf)
+    else:
+        log(f"  {folder}: {total} ta rasm", logf)
 
     q = queue.Queue(maxsize=PREFETCH)
     stop_event = threading.Event()
@@ -180,7 +241,7 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
             i = 0
             while i < len(names) and not stop_event.is_set():
                 window = names[i:i + DL_WORKERS]
-                for r in ex.map(lambda nm: (nm, thumb(host, token, folder, nm)), window):
+                for r in ex.map(lambda nm: (nm, thumb(host, TOKEN["v"], folder, nm)), window):
                     q.put(r)
                 i += DL_WORKERS
         q.put(None)
@@ -188,6 +249,7 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
 
     active = False; pf = []; gap = 0; n_cars = 0; n_done = 0; fails = 0; n_pass = 0
     t0 = time.time()
+    stalls = [0]            # server bo'g'ilib qolgan holatlar soni
     last_ts = None          # oxirgi SAQLANGAN mashinaning kadr vaqti
     last_kind = None        # oxirgi saqlangan mashinaning turi (car/bus/...)
     n_dup = 0               # takror deb tashlanganlar
@@ -208,7 +270,7 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
                 names = [names[int(i * step)] for i in range(MAX_PASSAGE_CHECK)]
             # big-previewlarni PARALLEL yuklaymiz (raqam thumbnailda juda kichik)
             def _dl(nm):
-                data = bigprev(host, token, folder, nm)
+                data = bigprev(host, TOKEN["v"], folder, nm)
                 try:
                     return nm, (Image.open(io.BytesIO(data)).convert("RGB") if data else None)
                 except Exception:
@@ -256,7 +318,7 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
                     log(f"    takror tashlandi ({kind or '?'}, "
                         f"{ts - last_ts:.1f}s oldingisidan keyin)", logf)
                 else:
-                    data = full(host, token, folder, best[1])
+                    data = full(host, TOKEN["v"], folder, best[1])
                     if data:
                         with open(os.path.join(seldir, best[1]), "wb") as fo:
                             fo.write(data)
@@ -283,9 +345,43 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
         n_done += 1
         if raw is None:
             fails += 1
-            if fails >= 100:        # server uzilgan — kamerani tashlab, keyin avto qayta urinadi
+            # 30 ta ketma-ket xato = token eskirgan BO'LISHI MUMKIN.
+            # Avval tokenni yangilab ko'ramiz — bu eng ko'p uchragan sabab.
+            # Yangilash yordam bermasa, xatolar 100 ga yetadi va to'xtaymiz.
+            # Server bo'g'ilgan bo'lishi mumkin — DAM BERAMIZ va davom etamiz.
+            # Avval 100 xatoda butunlay to'xtardi; endi bir necha marta
+            # "sovib" qayta urinadi (joy progress.txt da saqlanadi).
+            if fails in (30, 60, 90):
+                log(f"    {fails} ta xato ({LAST_ERR['v']}) — "
+                    f"{PAUSE_SEC:.0f}s dam beramiz", logf)
+                refresh_token(logf)
+                time.sleep(PAUSE_SEC)
+                continue
+            if fails >= 100 and stalls[0] < MAX_STALLS:
+                stalls[0] += 1
+                try:
+                    with open(pfile, "w", encoding="utf-8") as f:
+                        f.write(str(max(0, start + n_done - 150)))
+                except OSError:
+                    pass
+                log(f"    server javob bermayapti ({stalls[0]}/{MAX_STALLS}) — "
+                    f"{PAUSE_SEC*4:.0f}s kutamiz", logf)
+                time.sleep(PAUSE_SEC * 4)
+                refresh_token(logf)
+                fails = 0
+                continue
+            if fails >= 100:        # dam berish ham yordam bermadi
                 stop_event.set()
-                log(f"  {folder}: tarmoq uzildi — to'xtatildi (server qaytsa avto davom etadi)", logf)
+                # Joyni darhol saqlaymiz — qayta ishga tushganda SHU YERDAN
+                # davom etadi (avval kamera boshidan boshlanardi).
+                try:
+                    with open(pfile, "w", encoding="utf-8") as f:
+                        f.write(str(max(0, start + n_done - 150)))
+                except OSError:
+                    pass
+                log(f"  {folder}: tarmoq uzildi — to'xtatildi. "
+                    f"Joy saqlandi: {max(0, start + n_done - 150)} "
+                    f"(qayta ishga tushirsangiz SHU YERDAN davom etadi)", logf)
                 return False
             continue
         fails = 0
@@ -311,11 +407,21 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
                 close_passage()
         if n_done % 500 == 0:
             sp = n_done / (time.time() - t0)
-            log(f"  {folder}: {n_done}/{total} ({sp:.0f}/s) | "
+            log(f"  {folder}: {start + n_done}/{total} ({sp:.0f}/s) | "
                 f"o'tish: {n_pass} | mashina: {n_cars} | takror: {n_dup}", logf)
+            if not active:          # o'tish ochiq bo'lsa joyni yozmaymiz
+                try:
+                    with open(pfile, "w", encoding="utf-8") as f:
+                        f.write(str(start + n_done))
+                except OSError:
+                    pass
     if active:
         close_passage()
     log(f"  {folder}: ✓ {n_cars} ta mashina (to'liq skan qilindi)", logf)
+    try:
+        os.remove(pfile)        # tugadi — joy belgisi kerak emas
+    except OSError:
+        pass
     return True     # kamera to'liq skan qilindi
 
 
@@ -334,7 +440,9 @@ def main():
         log(f"=== SAYT: {site} ({host}) ===", logf)
         from PIL import Image
         # AVVAL login — server o'chiq bo'lsa, og'ir modellarni yuklamasdan tez chiqamiz (CPU tejaladi)
+        CREDS.update(host=host, user=user, pwd=pwd)
         token = login(host, user, pwd)
+        TOKEN["v"] = token
         from ultralytics import YOLO
         model = YOLO("yolov8n.pt"); model.fuse()           # mashina aniqlash
         plate_model = YOLO(PLATE_MODEL)                     # raqam (plaka) aniqlash
