@@ -12,7 +12,7 @@ Mantiq (har kamera uchun):
   - har o'tishdan FAQAT old tomoni ko'ringan 1 kadr (kadr tepasidagi = old) saqlanadi
   - MAX_SELECT ta mashina to'plangach o'sha kameradan to'xtaydi
 """
-import sys, os, io, json, time, queue, threading, urllib.request, urllib.parse
+import sys, os, io, json, time, queue, threading, urllib.request, urllib.parse, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 
 BASE       = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +54,10 @@ COOLDOWN_SEC = float(os.environ.get("COOLDOWN_SEC", "20"))
 # Server bo'g'ilganda qancha dam berish va necha marta urinish
 PAUSE_SEC  = float(os.environ.get("PAUSE_SEC", "30"))
 MAX_STALLS = int(os.environ.get("MAX_STALLS", "10"))
+# 2026-11-07: parking serveri uzluksiz yukda HTTP 500 bera boshlaydi
+# (qisqa sinovlarda 40/40 OK, lekin skan ishlaganda yiqiladi). Shuning
+# uchun so'rov tezligi cheklanadi va har "bo'g'ilish"da YANA pasayadi.
+MAX_RPS = float(os.environ.get("MAX_RPS", "8"))
 VEHICLE_NAMES = {2: "car", 3: "moto", 5: "bus", 7: "truck"}
 
 MAX_SELECT = int(os.environ.get("MAX_SELECT", "200"))
@@ -153,15 +157,55 @@ def login(host, user, pwd, retries=2):
 
 LAST_ERR = {"v": None}      # oxirgi xato sababi (log uchun) — 2026-11-07
 
+# ── So'rov tezligini cheklovchi (hamma so'rovlar shu yerdan o'tadi) ──
+_rl = {"rps": None, "next": 0.0, "lock": threading.Lock()}
+
+
+def rate_wait():
+    """Sekundiga MAX_RPS dan ko'p so'rov yubormaslik uchun kutadi."""
+    rps = _rl["rps"] or MAX_RPS
+    if rps <= 0:
+        return
+    gap = 1.0 / rps
+    with _rl["lock"]:
+        now = time.monotonic()
+        wait = _rl["next"] - now
+        _rl["next"] = max(now, _rl["next"]) + gap
+    if wait > 0:
+        time.sleep(wait)
+
+
+def slow_down(logf=None):
+    """Server bo'g'ilganda tezlikni ikki barobar pasaytiradi (eng kami 1/s)."""
+    cur = _rl["rps"] or MAX_RPS
+    _rl["rps"] = max(1.0, cur / 2)
+    if logf:
+        log(f"    tezlik pasaytirildi: {cur:.1f} -> {_rl['rps']:.1f} so'rov/s", logf)
+
 
 def _get(url, token, retries=3):
     for i in range(retries):
         try:
+            rate_wait()
             req = urllib.request.Request(url, headers={"X-Auth": token})
             return urllib.request.urlopen(req, timeout=20).read()  # tez aniqlash
         except Exception as e:
             code = getattr(e, "code", "")
-            LAST_ERR["v"] = f"{type(e).__name__}{code}"
+            kind = ("thumb" if "/preview/thumb/" in url else
+                    "big" if "/preview/big/" in url else
+                    "raw" if "/api/raw/" in url else "boshqa")
+            LAST_ERR["v"] = f"{kind}:{type(e).__name__}{code}"
+            # 2026-11-07 MUHIM FARQ:
+            #   server JAVOB berib xato qaytardi (HTTP 4xx/5xx) = SHU FAYL
+            #     buzuq/o'qilmaydi -> b"" qaytaramiz, skan uni tashlab ketadi
+            #   umuman javob yo'q (timeout/ulanmadi) = TARMOQ muammosi
+            #     -> None qaytaramiz, skan dam olib qayta uradi
+            # Avval ikkisi ham None edi va buzuq fayllar bloki (o'lchandi:
+            # minor/camera_enter_1 da 22048-22600 oralig'idagi walpd_* fayllar
+            # HTTP 500 beradi) "tarmoq uzildi" deb skanni to'xtatardi.
+            # 401/403 = token eskirgan -> None (yangilash mantig'i ishlasin)
+            if isinstance(e, urllib.error.HTTPError) and 500 <= e.code < 600:
+                return b""
             if i == retries - 1:
                 return None
             time.sleep(1)
@@ -250,6 +294,7 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
     active = False; pf = []; gap = 0; n_cars = 0; n_done = 0; fails = 0; n_pass = 0
     t0 = time.time()
     stalls = [0]            # server bo'g'ilib qolgan holatlar soni
+    n_bad = 0               # o'qib bo'lmagan (buzuq) fayllar
     last_ts = None          # oxirgi SAQLANGAN mashinaning kadr vaqti
     last_kind = None        # oxirgi saqlangan mashinaning turi (car/bus/...)
     n_dup = 0               # takror deb tashlanganlar
@@ -343,6 +388,12 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
             break
         name, raw = item
         n_done += 1
+        if raw == b"":          # fayl buzuq (server HTTP xato berdi) — tashlaymiz
+            n_bad += 1
+            fails = 0
+            if n_bad % 500 == 0:
+                log(f"    {n_bad} ta fayl o'qilmadi (server xatosi) — tashlab ketilmoqda", logf)
+            continue
         if raw is None:
             fails += 1
             # 30 ta ketma-ket xato = token eskirgan BO'LISHI MUMKIN.
@@ -364,6 +415,7 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
                         f.write(str(max(0, start + n_done - 150)))
                 except OSError:
                     pass
+                slow_down(logf)
                 log(f"    server javob bermayapti ({stalls[0]}/{MAX_STALLS}) — "
                     f"{PAUSE_SEC*4:.0f}s kutamiz", logf)
                 time.sleep(PAUSE_SEC * 4)
@@ -408,7 +460,8 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
         if n_done % 500 == 0:
             sp = n_done / (time.time() - t0)
             log(f"  {folder}: {start + n_done}/{total} ({sp:.0f}/s) | "
-                f"o'tish: {n_pass} | mashina: {n_cars} | takror: {n_dup}", logf)
+                f"o'tish: {n_pass} | mashina: {n_cars} | takror: {n_dup}"
+                f"{f' | buzuq: {n_bad}' if n_bad else ''}", logf)
             if not active:          # o'tish ochiq bo'lsa joyni yozmaymiz
                 try:
                     with open(pfile, "w", encoding="utf-8") as f:
