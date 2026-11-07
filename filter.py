@@ -25,17 +25,19 @@ MIN_AREA  = 0.05    # "mashina bor" deb hisoblash uchun eng kichik maydon
 GAP_FRAMES = 4      # shuncha ketma-ket bo'sh kadr = mashina o'tdi
 # Raqam (plaka) detektori — har mashinaning kadrlarini tekshiradi (kamera burchagidan mustaqil)
 PLATE_MODEL = "plate_yolo.pt"
-# 2026-11-07 (egasining qarori): 0.10 -> 0.45.
-# Dalil: egasi qo'lda o'chirgan rasmlar 0.129 / 0.132 / 0.206 ishonchli
-# edi (ularda raqam KO'RINMAYDI), qoldirgani 0.742 (raqam toza o'qiladi).
-# 0.45 chegarasi shu ajratishni avtomatik qiladi.
-PLATE_TH    = float(os.environ.get("PLATE_TH", "0.45"))
+# 0.45 sinab ko'rildi (raqam ko'rinmagan rasmlarni to'sish uchun), lekin
+# natija juda kam bo'ldi — 67 114 rasmdan 2 ta. Egasining talabi bilan
+# ESKI qiymatga qaytarildi. Qattiqroq kerak bo'lsa:
+#     PLATE_TH=0.45 python filter.py <sayt>
+PLATE_TH    = float(os.environ.get("PLATE_TH", "0.10"))
 MAX_PASSAGE_CHECK = 40   # bir mashinada eng ko'pi shuncha kadr raqamga tekshiriladi
 IMGSZ     = 256
-# 2026-11-07 (egasining qarori): FAQAT yengil avtomobil.
-# COCO sinflari: 2=car, 3=moto, 5=bus, 7=truck. Moto/yuk/avtobus KERAKMAS.
-# Kerak bo'lsa: VEHICLE_CLASSES="2,5,7" python filter.py <sayt>
-VEHICLE   = {int(x) for x in os.environ.get("VEHICLE_CLASSES", "2").split(",") if x.strip()}
+# COCO sinflari: 2=car, 3=moto, 5=bus, 7=truck.
+# FAQAT avtomobil sinab ko'rildi ({2}), lekin o'tish aniqlash ham shunga
+# bog'lanib, mashinalar qo'ldan keta boshladi (kechasi YOLO ba'zan "truck"
+# deb tasniflaydi). Eski holat qaytarildi — hamma transport.
+# Faqat avtomobil kerak bo'lsa: VEHICLE_CLASSES="2" python filter.py <sayt>
+VEHICLE   = {int(x) for x in os.environ.get("VEHICLE_CLASSES", "2,3,5,7").split(",") if x.strip()}
 # 2026-11-07 O'LCHANDI: 16 parallel so'rov parking serverini bo'g'ib qo'yardi.
 # Xato: HTTP 500 (server thumbnail yasay olmayapti).
 # O'LCHOV: o'sha 200 ta fayl 4 parallel bilan 200/200 ochildi, 8-16 parallel
@@ -211,9 +213,23 @@ def _get(url, token, retries=3):
             time.sleep(1)
 
 
-def list_dir(host, token, path):
-    raw = _get(host + "/api/resources/" + urllib.parse.quote(path), token)
-    return json.loads(raw) if raw else {"items": []}
+def list_dir(host, token, path, timeout=180, retries=4):
+    """Papka ro'yxati. KATTA papkada javob 15 MB bo'ladi va 20 soniyaga
+    ulgurmaydi — 2026-11-07 da aynan shu sabab camera_exit_1 (41 099 rasm)
+    va camera_exit_2 (50 429 rasm) "0 ta rasm" deb o'tkazib yuborilgan.
+    Shuning uchun bu yerda timeout uzun va urinishlar ko'p."""
+    url = host + "/api/resources/" + urllib.parse.quote(path)
+    for i in range(retries):
+        try:
+            rate_wait()
+            req = urllib.request.Request(url, headers={"X-Auth": token})
+            raw = urllib.request.urlopen(req, timeout=timeout).read()
+            if raw:
+                return json.loads(raw)
+        except Exception as e:
+            LAST_ERR["v"] = f"ro'yxat:{type(e).__name__}{getattr(e,'code','')}"
+            time.sleep(3 * (i + 1))
+    return {"items": []}
 
 
 def list_images(host, token, folder):
@@ -270,6 +286,13 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
             start = max(0, min(int(f.read().strip()), total))
     except (OSError, ValueError):
         start = 0
+    if total == 0:
+        # Ro'yxat olinmadi (yoki papka haqiqatan bo'sh). TUGADI deb
+        # belgilamaymiz — aks holda minglab rasm jimgina o'tkazib yuboriladi.
+        log(f"  {folder}: ro'yxat BO'SH keldi ({LAST_ERR['v']}) — "
+            f"kamera tugadi deb belgilanmaydi, keyin qayta urinamiz", logf)
+        return False
+
     names = all_names[start:]
     if start:
         log(f"  {folder}: {total} ta rasm — {start}-dan DAVOM etamiz "
