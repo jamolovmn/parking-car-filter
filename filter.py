@@ -12,7 +12,7 @@ Mantiq (har kamera uchun):
   - har o'tishdan FAQAT old tomoni ko'ringan 1 kadr (kadr tepasidagi = old) saqlanadi
   - MAX_SELECT ta mashina to'plangach o'sha kameradan to'xtaydi
 """
-import sys, os, io, json, time, queue, threading, itertools, urllib.request, urllib.parse
+import sys, os, io, json, time, queue, threading, urllib.request, urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 BASE       = os.path.dirname(os.path.abspath(__file__))
@@ -25,24 +25,12 @@ MIN_AREA  = 0.05    # "mashina bor" deb hisoblash uchun eng kichik maydon
 GAP_FRAMES = 4      # shuncha ketma-ket bo'sh kadr = mashina o'tdi
 # Raqam (plaka) detektori — har mashinaning kadrlarini tekshiradi (kamera burchagidan mustaqil)
 PLATE_MODEL = "plate_yolo.pt"
-# 2026-11-07 O'LCHANDI: 0.10 juda past edi — raqam KO'RINMAYDIGAN kadrlar
-# o'tib ketardi. Ko'z bilan tekshirildi: 0.403 -> rasmda raqam YO'Q (mashina
-# yon tomoni), 0.758 -> raqam toza o'qiladi ("01 K 477 TC"). Shuning uchun
-# chegara 0.50. Natija: raqami ko'rinmagan mashina SAQLANMAYDI.
-# Juda kam mashina chiqsa -> PLATE_TH=0.35 qilib ko'ring.
-PLATE_TH    = float(os.environ.get("PLATE_TH", "0.50"))
-# 2026-11-07: 40 -> 10. AVVAL 40 ga qaytargan edim ("raqam ko'rinmaydi"
-# deb), lekin O'LCHOV buni RAD ETDI: 40 kadr ham, 10 kadr ham AYNAN bir
-# xil kadrni tanladi (5/5), ishonchlar ham bir xil. Ya'ni 40 kadr sifat
-# bermay, tezlikni 19 -> 7 rasm/s ga tushirardi. Sifat muammosi kadr
-# sonida emas, PLATE_TH chegarasida edi (pastga qarang).
-MAX_PASSAGE_CHECK = int(os.environ.get("MAX_PASSAGE_CHECK", "10"))
+PLATE_TH    = 0.10   # shu ishonchdan yuqori = "raqam bor" (o'rtacha: uzoq/raqamsizni tashlaydi, raqamlini oladi)
+MAX_PASSAGE_CHECK = 40   # bir mashinada eng ko'pi shuncha kadr raqamga tekshiriladi
 IMGSZ     = 256
 VEHICLE   = {2, 3, 5, 7}
 DL_WORKERS = 16
-# 2026-11-07: 16 -> 256. Kichik bufer kanalni bo'sh qoldirardi
-# (256 x 27 KB = ~7 MB xotira, arzon).
-PREFETCH  = 256
+PREFETCH  = 16
 # 2026-11-04: egasining talabi bilan 50 -> 200 (har kameradan max mashina).
 MAX_SELECT = int(os.environ.get("MAX_SELECT", "200"))
 # Disk himoyasi: yig'ilgan rasmlar shuncha GB dan oshsa — yig'ish PAUZA
@@ -169,50 +157,13 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
     stop_event = threading.Event()
 
     def producer():
-        # 2026-11-07 O'LCHANGAN TUZATISH: avval rasmlar 16 talik "deraza" bilan
-        # olinardi va har derazada ENG SEKINI kutilardi — o'sha paytda kanal
-        # ham, CPU ham bo'sh turardi. Bitta sayt uchun toza yuklash ~4,5 soat
-        # bo'lgani holda skan ~11 soat ketgan: ~6,5 soat shu kutishga ketgan.
-        #
-        # Endi uzluksiz: har yuklovchi bo'shashi bilan keyingi rasmni oladi.
-        # MUHIM: mashina o'tishini aniqlash KETMA-KETLIKKA bog'liq (4 ta
-        # ketma-ket bo'sh kadr = mashina o'tdi), shuning uchun natijalar
-        # tartibsiz kelsa ham, bu yerda TARTIB TIKLANADI (reorder bufer).
-        idx = itertools.count()
-        names_n = len(names)
-        ready = {}                      # indeks -> (nom, ma'lumot)
-        lock = threading.Lock()
-        nxt = 0                         # navbatdagi (kutilayotgan) indeks
-
-        def worker():
-            nonlocal nxt
-            while not stop_event.is_set():
-                i = next(idx)
-                if i >= names_n:
-                    return
-                nm = names[i]
-                try:
-                    data = thumb(host, token, folder, nm)
-                except Exception:
-                    data = None
-                # Qulf FAQAT lug'at uchun: q.put() navbat to'lganda bloklaydi,
-                # shuning uchun uni qulfdan TASHQARIDA bajaramiz — aks holda
-                # bitta kutayotgan yuklovchi qolgan 15 tasini to'xtatib qo'yadi.
-                out = []
-                with lock:
-                    ready[i] = (nm, data)
-                    while nxt in ready:
-                        out.append(ready.pop(nxt))
-                        nxt += 1
-                for item in out:
-                    q.put(item)                     # (nom, ma'lumot) — eski shakl
-
-        ths = [threading.Thread(target=worker, daemon=True)
-               for _ in range(DL_WORKERS)]
-        for t in ths:
-            t.start()
-        for t in ths:
-            t.join()
+        with ThreadPoolExecutor(max_workers=DL_WORKERS) as ex:
+            i = 0
+            while i < len(names) and not stop_event.is_set():
+                window = names[i:i + DL_WORKERS]
+                for r in ex.map(lambda nm: (nm, thumb(host, token, folder, nm)), window):
+                    q.put(r)
+                i += DL_WORKERS
         q.put(None)
     threading.Thread(target=producer, daemon=True).start()
 
@@ -301,11 +252,7 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
                 close_passage()
         if n_done % 500 == 0:
             sp = n_done / (time.time() - t0)
-            # n_pass = topilgan o'tishlar soni. MUHIM: raqami ko'rinmagan
-            # o'tish ham TASHLANADI, lekin katta rasmlar u uchun ham yuklanadi.
-            # Shuning uchun haqiqiy yuk n_cars emas, n_pass bo'yicha o'lchanadi.
-            log(f"  {folder}: {n_done}/{total} ({sp:.0f}/s) | "
-                f"o'tish: {n_pass} | mashina: {n_cars}", logf)
+            log(f"  {folder}: {n_done}/{total} ({sp:.0f}/s) | mashina: {n_cars}", logf)
     if active:
         close_passage()
     log(f"  {folder}: ✓ {n_cars} ta mashina (to'liq skan qilindi)", logf)
