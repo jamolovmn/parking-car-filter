@@ -1,31 +1,173 @@
-# Parking Car Deduplication & Filter
+# parking-car-filter
 
-Bu loyiha Filebrowser orqali saqlanadigan parkovka kameralaridan olingan rasmlarni YOLO modellari yordamida saralash (deduplikatsiya) uchun mo'ljallangan.
+Parking kameralarining arxividan **mashinalarni ajratib oladi** va har mashinadan
+**raqami eng yaxshi ko'ringan bitta kadrni** to'liq o'lchamda saqlaydi.
 
-## Imkoniyatlari
+Kameralar har soniyada kadr yozadi — bitta saytda 100-160 ming rasm to'planadi.
+Ularning ko'pi bo'sh yo'l yoki bir mashinaning o'nlab takror kadri. Bu dastur
+shundan faqat kerakligini qoldiradi: har o'tgan mashinadan **1 ta rasm**.
 
-- **YOLO orqali aniqlash:** `yolov8n.pt` orqali kadrlarda mashinalar bor-yo'qligi skanerlanadi.
-- **Raqamni aniqlash:** `plate_yolo.pt` yordamida mashinaning old qismi va davlat raqami (plaka) bor kadrlar saralab olinadi. 
-- **O'tishlarni (passage) ajratish:** Bitta mashinaning ketma-ket o'tgan bir nechta kadrlari o'rniga eng yaxshi bitta kadr (old qismi yaqqol ko'ringan kadr) qoldiriladi.
-- **Masofadan boshqarish:** `sites.json` faylidan sayt URL, username va parollarni o'qib, Filebrowser API orqali masofadagi serverga bog'lanadi.
+Raqamni **O'QIMAYDI** (OCR yo'q) — faqat raqam ko'rinayotgan kadrni tanlaydi.
 
-## Fayllar vazifasi
+---
 
-- `filter.py`: Berilgan sayt (parkovka) uchun rasmlarni yuklab, YOLO orqali mashinalarni topish va faqat old tomoni ko'ringan bitta kadrni qoldirish logikasini bajaradi. Yig'ilgan natijalar `output/` papkasiga saqlanadi.
-- `upload.py`: Saralangan (deduplikatsiya qilingan) sifatli kadrlarni orqaga, Filebrowser serveridagi maxsus papkaga yuklab beradi.
-- `sites.json`: Parkovka ob'ektlarining ro'yxati va ularga kirish huquqlari (URL, username, password).
-- `*.pt` (yolov8n, plate_yolo): Og'irlik (weights) fayllari (Git-ga kiritilmagan).
+## Qanday ishlaydi
 
-## Ishlatilishi
+```
+  kichik rasm (thumb, 7-27 KB)
+        │
+        ▼
+  YOLOv8n ──► kadrda mashina bormi? (256px, CONF=0.40, maydon ≥ 5%)
+        │
+        ▼
+  4 ta ketma-ket bo'sh kadr  =  "mashina o'tdi"  (GAP_FRAMES)
+        │
+        ▼
+  o'sha mashinaning 40 kadri KATTA holda yuklanadi (MAX_PASSAGE_CHECK)
+        │
+        ▼
+  plate_yolo ──► har kadrda raqam qidiradi, eng ishonchlisini tanlaydi
+        │
+        ▼
+  ishonch ≥ PLATE_TH (0.10) bo'lsa → o'sha kadr TO'LIQ o'lchamda saqlanadi
+  bo'lmasa → bu mashina tashlanadi (uzoq/yon kadr, raqam ko'rinmagan)
+```
 
-1. Kerakli Python kutubxonalarini (YOLO, va h.k.) o'rnating.
-2. `filter.py` orqali kerakli ob'ekt uchun rasmlarni saralang:
-   ```bash
-   python filter.py fayzobod
-   ```
-3. Tanlangan va ajratib olingan rasmlarni serverga qayta yuklang:
-   ```bash
-   python upload.py <host> <parol> <lokal_papka> <masofaviy_papka>
-   ```
+Natija: `output/<sayt>/<kamera>/selected/*.png`
 
-*Eslatma: `*.pt` modellar fayllari va yig'ilgan `output/` jildi hajmi katta bo'lganligi sababli, `.gitignore` orqali GitHub'ga yuklanishi cheklangan.*
+---
+
+## O'rnatish
+
+Kerak: **Python 3.9+**. GPU shart emas — CPU yetadi.
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install ultralytics pillow
+```
+
+Modellar repoda: `yolov8n.pt` (mashina) va `plate_yolo.pt` (raqam).
+Qo'shimcha yuklab olish kerak emas.
+
+> `.gitignore` da `*.pt` bor edi — modellar repoga **ataylab** qo'shildi,
+> chunki ularsiz dastur ishlamaydi.
+
+---
+
+## Sozlash
+
+`sites.json` — qaysi parkingdan yig'ish:
+
+```json
+{
+  "minor": {
+    "host": "https://275.app.ioedge.host",
+    "user": "admin",
+    "password": "PAROL"
+  }
+}
+```
+
+**`host` faqat manzil bo'lsin.** Brauzerdan ko'chirilgan
+`https://275.app.ioedge.host/login?redirect=/files` **ishlamaydi** —
+API yo'li buziladi va `404` keladi.
+
+---
+
+## Ishga tushirish
+
+```bash
+python filter.py minor
+```
+
+Natija:
+
+```
+output/minor/camera_enter_1/selected/*.png     ← tanlangan mashinalar
+output/minor/scan.log                           ← jarayon logi
+```
+
+Log shunday ko'rinadi:
+
+```
+[15:18:37]   dataset/camera_enter_1: 5000/67114 (19/s) | mashina: 11
+```
+
+**Uzilsa** — xuddi shu buyruqni qayta bering. Tugagan kameralarni
+(`.done` belgisi) o'tkazib yuboradi. Tugamagan kamerani **boshidan**
+boshlaydi — joyni kamera darajasida eslaydi, har rasm darajasida emas.
+
+### Tezlikni oldindan bilish
+
+```bash
+python tezlik-test.py
+```
+
+Hech narsa o'rnatmasdan, 200 ta rasmni yuklab tezligingizni o'lchaydi va
+sayt uchun necha soat ketishini aytadi.
+
+---
+
+## Sozlamalar
+
+Fayl boshida yoki muhit o'zgaruvchisi orqali:
+
+| nom | standart | ma'nosi |
+|---|---|---|
+| `MAX_SELECT` | 200 | har kameradan maksimal mashina |
+| `MAX_PASSAGE_CHECK` | 40 | har mashinada raqamga tekshiriladigan kadr |
+| `PLATE_TH` | 0.10 | shundan past = "raqam yo'q", mashina tashlanadi |
+| `CONF` | 0.40 | mashina aniqlash ishonchi |
+| `MIN_AREA` | 0.05 | kadrdagi eng kichik mashina maydoni |
+| `GAP_FRAMES` | 4 | shuncha bo'sh kadr = mashina o'tdi |
+| `DL_WORKERS` | 16 | parallel yuklovchilar |
+| `MAX_OUTPUT_GB` | 50 | disk to'lsa pauza qiladi |
+
+```bash
+# Linux/Mac
+MAX_SELECT=300 python filter.py minor
+# Windows
+set MAX_SELECT=300 && python filter.py minor
+```
+
+---
+
+## O'lchangan ko'rsatkichlar
+
+2026-11-07 da olingan (VPS, 0.9 yadro cheklovi bilan):
+
+| | 241 (beruniy) | 275 (minor) |
+|---|---|---|
+| rasm soni | 100 921 | 158 642 |
+| kichik rasm | 27 KB | 7 KB |
+| katta rasm | 410 KB | 91 KB |
+| yuklash tezligi | 18-20 rasm/s | 19-27 rasm/s |
+| YOLO (CPU, 256px) | 26 rasm/s | — |
+| **to'liq skan** | **~11 soat** | — |
+
+**Cheklov — kanal, protsessor emas.** O'lchov: keshlangan rasmni qayta
+so'raganda ham tezlik o'zgarmadi (18 rasm/s), ya'ni server thumbnail
+yasashga ulgurmayotgani emas — kanal 4-5 Mbit/s da to'yingan.
+
+Shuning uchun **kuchliroq protsessor yordam bermaydi**. Tezlashtirishning
+yagona yo'li — kamera serveriga yaqinroq joydan (masalan o'sha shahardagi
+kompyuterdan) ishlatish.
+
+| kanal tezligi | 100 000 rasm |
+|---|---|
+| 4 Mbit/s | ~11 soat |
+| 20 Mbit/s | ~2.5 soat |
+| 50 Mbit/s | ~1 soat |
+
+---
+
+## Ma'lum kamchiliklar
+
+- **Bitta mashina bir necha marta saqlanishi mumkin.** Kechasi qora mashina
+  ba'zi kadrlarda aniqlanmaydi; 4 ta shunday kadr "mashina o'tdi" deb
+  hisoblanadi va bitta o'tish ikkiga bo'linadi.
+- **Uzilgan kamera boshidan boshlanadi** — joy faqat kamera darajasida
+  eslanadi.
+- `PLATE_TH=0.10` past: raqam ko'rinmagan kadrlar ham o'tib ketishi mumkin
+  (o'lchangan: 0.40 ishonchli kadrda ham raqam bo'lmasligi mumkin, 0.75 da
+  toza o'qiladi). Chegarani ko'tarish mashina sonini kamaytiradi.

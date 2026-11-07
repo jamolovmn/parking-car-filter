@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Bitta SAYT (parkovka) uchun: sites.json dan host+parol o'qiydi → filebrowser'dagi
-`dataset/` ichidagi HAMMA kamerani topib, har biridan max 100 ta MASHINA (old tomoni
+`dataset/` ichidagi HAMMA kamerani topib, har biridan max MAX_SELECT ta MASHINA (standart 200, old tomoni
 ko'ringan) kadrini ajratadi.
 
 Ishlatish:  python filter.py <site>        (masalan: python filter.py fayzobod)
@@ -10,7 +10,7 @@ Mantiq (har kamera uchun):
   - thumbnail (kichik) bilan tez skan → YOLO mashina bor-yo'qligi
   - ketma-ket mashinali kadrlar = bitta "o'tish" (passage)
   - har o'tishdan FAQAT old tomoni ko'ringan 1 kadr (kadr tepasidagi = old) saqlanadi
-  - 100 ta mashina to'plangach o'sha kameradan to'xtaydi
+  - MAX_SELECT ta mashina to'plangach o'sha kameradan to'xtaydi
 """
 import sys, os, io, json, time, queue, threading, urllib.request, urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -31,7 +31,8 @@ IMGSZ     = 256
 VEHICLE   = {2, 3, 5, 7}
 DL_WORKERS = 16
 PREFETCH  = 16
-MAX_SELECT = int(os.environ.get("MAX_SELECT", "50"))
+# 2026-11-04: egasining talabi bilan 50 -> 200 (har kameradan max mashina).
+MAX_SELECT = int(os.environ.get("MAX_SELECT", "200"))
 # Disk himoyasi: yig'ilgan rasmlar shuncha GB dan oshsa — yig'ish PAUZA
 # (zip yuklab, eskilarni o'chirasiz → joy bo'shaydi → o'zi davom etadi).
 MAX_OUTPUT_GB = int(os.environ.get("MAX_OUTPUT_GB", "50"))
@@ -78,7 +79,19 @@ def load_site(name):
     return s["host"].rstrip("/"), s.get("user", "admin"), s["password"]
 
 
+def _clean_host(host):
+    """Brauzerdan ko'chirilgan '/login?redirect=/files' qismini tashlaydi —
+    aks holda API yo'li buziladi va 404 keladi (2026-11-04)."""
+    import urllib.parse as _up
+    h = (host or "").strip().rstrip("/")
+    if not h.startswith("http"):
+        h = "https://" + h
+    u = _up.urlsplit(h)
+    return f"{u.scheme}://{u.netloc}"
+
+
 def login(host, user, pwd, retries=2):
+    host = _clean_host(host)
     data = json.dumps({"username": user, "password": pwd}).encode()
     last = None
     for i in range(retries):
@@ -251,6 +264,7 @@ def main():
         print("Ishlatish: python filter.py <site>"); sys.exit(1)
     site = sys.argv[1].strip().lower()
     host, user, pwd = load_site(site)
+    host = _clean_host(host)           # havola brauzerdan ko'chirilgan bo'lsa ham ishlaydi
     outdir = os.path.join(OUTBASE, site)
     os.makedirs(outdir, exist_ok=True)
     running = os.path.join(outdir, ".running")

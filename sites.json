@@ -1,6 +1,27 @@
 {
-  "fayzobod": {"host": "https://238.app.ioedge.host", "user": "admin", "password": "zMv76m8Zai8sYB_L"},
-  "bashliq":  {"host": "https://239.app.ioedge.host", "user": "admin", "password": "yl_1grNoCHHviZml"},
-  "olmazor":  {"host": "https://240.app.ioedge.host", "user": "admin", "password": "bM21Onu9yg7S08W1"},
-  "beruniy":  {"host": "https://241.app.ioedge.host", "user": "admin", "password": "vsZeBPfa92b1PxVA"}
+  "fayzobod": {
+    "host": "https://238.app.ioedge.host",
+    "user": "admin",
+    "password": "zMv76m8Zai8sYB_L"
+  },
+  "bashliq": {
+    "host": "https://239.app.ioedge.host",
+    "user": "admin",
+    "password": "yl_1grNoCHHviZml"
+  },
+  "olmazor": {
+    "host": "https://240.app.ioedge.host",
+    "user": "admin",
+    "password": "bM21Onu9yg7S08W1"
+  },
+  "beruniy": {
+    "host": "https://241.app.ioedge.host",
+    "user": "admin",
+    "password": "1919zuAXdXtLkNo2"
+  },
+  "minor": {
+    "host": "https://275.app.ioedge.host",
+    "user": "admin",
+    "password": "4xerbNis844AXexh"
+  }
 }
