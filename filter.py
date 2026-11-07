@@ -32,6 +32,14 @@ VEHICLE   = {2, 3, 5, 7}
 DL_WORKERS = 16
 PREFETCH  = 16
 # 2026-11-04: egasining talabi bilan 50 -> 200 (har kameradan max mashina).
+# 2026-11-07 (egasining talabi): bitta mashina KETMA-KET bir necha marta
+# saqlanib qolardi — kechasi mashina ba'zi kadrlarda aniqlanmaydi va bitta
+# o'tish ikkiga bo'linadi. Endi mashina saqlangach, qisqa "sovish" vaqti
+# kutiladi; shu vaqt ichidagi O'SHA TURDAGI mashina bir xil deb tashlanadi.
+# Tur boshqa bo'lsa (masalan avtobus keldi) — darhol o'tadi, kutilmaydi.
+COOLDOWN_SEC = float(os.environ.get("COOLDOWN_SEC", "20"))
+VEHICLE_NAMES = {2: "car", 3: "moto", 5: "bus", 7: "truck"}
+
 MAX_SELECT = int(os.environ.get("MAX_SELECT", "200"))
 # Disk himoyasi: yig'ilgan rasmlar shuncha GB dan oshsa — yig'ish PAUZA
 # (zip yuklab, eskilarni o'chirasiz → joy bo'shaydi → o'zi davom etadi).
@@ -146,6 +154,17 @@ def full(host, token, folder, name):
     return _get(host + "/api/raw/" + urllib.parse.quote(folder + "/" + name), token)
 
 
+def frame_ts(name):
+    """Fayl nomidan vaqtni oladi: 'wavd_1793986287637735.png' -> 1793986287.637
+    (16 xonali mikrosoniya). Topilmasa None."""
+    import re
+    m = re.search(r"(\d{13,19})", name)
+    if not m:
+        return None
+    d = m.group(1)
+    return int(d) / (10 ** (len(d) - 10))
+
+
 def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
     """Bitta kamera papkasini skan qiladi. Tanlangan mashinalar sonini qaytaradi."""
     os.makedirs(seldir, exist_ok=True)
@@ -169,6 +188,9 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
 
     active = False; pf = []; gap = 0; n_cars = 0; n_done = 0; fails = 0; n_pass = 0
     t0 = time.time()
+    last_ts = None          # oxirgi SAQLANGAN mashinaning kadr vaqti
+    last_kind = None        # oxirgi saqlangan mashinaning turi (car/bus/...)
+    n_dup = 0               # takror deb tashlanganlar
 
     def close_passage():
         # Mashinaning kadrlarini RAQAM-DETEKTOR bilan tekshiramiz:
@@ -176,7 +198,7 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
         #   - eng yaxshi (ishonchi eng yuqori) raqamli kadrni saqlaymiz
         #   - hech qaysi kadrda raqam yo'q bo'lsa — bu mashina TASHLANADI
         # Bu kamera burchagidan MUSTAQIL (uzoq/yon kadrlarda raqam yo'q → o'zi tushib qoladi).
-        nonlocal n_cars, pf, active, n_pass
+        nonlocal n_cars, pf, active, n_pass, last_ts, last_kind, n_dup
         if pf:
             n_pass += 1                          # bitta mashina o'tishi topildi
             disk_guard(logf)                    # disk to'lsa — pauza
@@ -205,11 +227,48 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
             # RAQAM bor bo'lsa (≥ PLATE_TH) → raqam eng aniq ko'ringan kadrni saqlaymiz.
             # Yo'q bo'lsa (uzoq/yon/raqamsiz) → bu mashina TASHLANADI.
             if best[1] is not None and best[0] >= PLATE_TH:
-                data = full(host, token, folder, best[1])
-                if data:
-                    with open(os.path.join(seldir, best[1]), "wb") as fo:
-                        fo.write(data)
-                    n_cars += 1
+                # Mashina TURI (eng katta mashina qutisining sinfi) — tanlangan
+                # kadr bo'yicha aniqlanadi. Takrorni ajratish uchun kerak.
+                kind = None
+                bim = dict(imgs).get(best[1])
+                if bim is not None:
+                    vr = model.predict(bim, imgsz=IMGSZ, conf=CONF, verbose=False)[0]
+                    bigbox = 0.0
+                    for bb in vr.boxes:
+                        cl = int(bb.cls)
+                        if cl in VEHICLE:
+                            x1, y1, x2, y2 = bb.xyxy[0].tolist()
+                            ar = (x2 - x1) * (y2 - y1)
+                            if ar > bigbox:
+                                bigbox, kind = ar, VEHICLE_NAMES.get(cl, str(cl))
+
+                # TAKROR TEKSHIRUVI: oxirgi saqlangandan beri COOLDOWN_SEC
+                # o'tmagan bo'lsa VA turi o'sha bo'lsa -> bu o'sha mashina.
+                ts = frame_ts(best[1])
+                dup = False
+                if (COOLDOWN_SEC > 0 and last_ts is not None and ts is not None
+                        and (ts - last_ts) < COOLDOWN_SEC
+                        and (kind == last_kind or kind is None or last_kind is None)):
+                    dup = True
+
+                if dup:
+                    n_dup += 1
+                    log(f"    takror tashlandi ({kind or '?'}, "
+                        f"{ts - last_ts:.1f}s oldingisidan keyin)", logf)
+                else:
+                    data = full(host, token, folder, best[1])
+                    if data:
+                        with open(os.path.join(seldir, best[1]), "wb") as fo:
+                            fo.write(data)
+                        n_cars += 1
+                        last_ts, last_kind = ts, kind
+                        # turini alohida faylga yozamiz (rasm nomi o'zgarmaydi)
+                        try:
+                            with open(os.path.join(seldir, "turlar.csv"), "a",
+                                      encoding="utf-8") as tf:
+                                tf.write(f"{best[1]},{kind or '?'},{best[0]:.3f}\n")
+                        except OSError:
+                            pass
         pf = []; active = False
 
     while True:
@@ -252,7 +311,8 @@ def scan_camera(host, token, folder, seldir, model, plate_model, Image, logf):
                 close_passage()
         if n_done % 500 == 0:
             sp = n_done / (time.time() - t0)
-            log(f"  {folder}: {n_done}/{total} ({sp:.0f}/s) | mashina: {n_cars}", logf)
+            log(f"  {folder}: {n_done}/{total} ({sp:.0f}/s) | "
+                f"o'tish: {n_pass} | mashina: {n_cars} | takror: {n_dup}", logf)
     if active:
         close_passage()
     log(f"  {folder}: ✓ {n_cars} ta mashina (to'liq skan qilindi)", logf)
